@@ -1,21 +1,28 @@
-"""HTTP client for SeaClip-Lite FastAPI backend."""
+"""HTTP client for SeaClip-Lite FastAPI backend.
+
+Some endpoints return HTMX partials, not JSON. For those we fall back
+to direct SQLite reads from the SeaClip-Lite database.
+"""
 
 import os
+import sqlite3
 import requests
 from typing import Any
 
 DEFAULT_BASE_URL = "http://127.0.0.1:5200"
+DEFAULT_DB_PATH = "/Users/whitenoise-oc/shrirama/seaclip-lite/seaclip.db"
 
 
 class SeaClipBackend:
     """Thin HTTP client wrapping the SeaClip-Lite FastAPI endpoints."""
 
-    def __init__(self, base_url: str | None = None, timeout: int = 30):
+    def __init__(self, base_url: str | None = None, db_path: str | None = None, timeout: int = 30):
         self.base_url = (
             base_url
             or os.environ.get("SEACLIP_URL")
             or DEFAULT_BASE_URL
         ).rstrip("/")
+        self.db_path = db_path or os.environ.get("SEACLIP_DB") or DEFAULT_DB_PATH
         self.timeout = timeout
         self.session = requests.Session()
 
@@ -81,10 +88,24 @@ class SeaClipBackend:
     def delete_issue(self, issue_id: str) -> dict:
         return self._delete(f"/api/issues/{issue_id}")
 
+    # ── helpers (SQLite) ─────────────────────────────────────────────
+
+    def _query_db(self, sql: str, params: tuple = ()) -> list[dict]:
+        """Run a read-only query against SeaClip-Lite's SQLite database."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
     # ── agents ────────────────────────────────────────────────────────
 
     def list_agents(self) -> list[dict]:
-        return self._get("/api/agents")
+        return self._query_db(
+            "SELECT name, role, status, current_issue_id, last_completed_at, last_error, updated_at FROM agents ORDER BY created_at"
+        )
 
     # ── pipeline ──────────────────────────────────────────────────────
 
@@ -103,7 +124,9 @@ class SeaClipBackend:
     # ── scheduler ─────────────────────────────────────────────────────
 
     def list_schedules(self) -> list[dict]:
-        return self._get("/api/scheduler")
+        return self._query_db(
+            "SELECT id, repo, enabled, interval_minutes, target_column, auto_pipeline, pipeline_mode, ai_mode, last_synced_at, issues_synced FROM schedule_configs ORDER BY id"
+        )
 
     def add_schedule(self, config: dict) -> dict:
         return self._post("/api/scheduler/add", json=config)
@@ -114,7 +137,8 @@ class SeaClipBackend:
     # ── activity ──────────────────────────────────────────────────────
 
     def list_activity(self, limit: int | None = None) -> list[dict]:
-        params: dict[str, Any] = {}
-        if limit:
-            params["limit"] = limit
-        return self._get("/api/activity", params=params)
+        lim = limit or 20
+        return self._query_db(
+            "SELECT event_type, summary, created_at FROM activity_log ORDER BY created_at DESC LIMIT ?",
+            (lim,),
+        )
